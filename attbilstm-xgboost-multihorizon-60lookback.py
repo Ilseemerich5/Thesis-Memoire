@@ -6,6 +6,15 @@ Att-BiLSTM + XGBoost hybrid model
 Look-back window: 60 days
 =============================================================
 """
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Mar 29 21:29:59 2026
+
+@author: ilsem
+"""
+
+=============================================================
+"""
 
 import pandas as pd
 import numpy as np
@@ -23,25 +32,24 @@ from tensorflow.keras.layers import (Input, Bidirectional, LSTM,
                                      Dense, Dropout, Attention)
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.regularizers import l2
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import seaborn as sns
 
-
+# ============================================================
 # 1. CONFIGURATION
+# ============================================================
 
-
-HORIZONS      = [1, 7, 14, 30]       # forecasting horizons in days
-MODEL_TYPES   = ['a', 'b', 'c']      # ablation study models
+HORIZONS      = [1, 7, 14, 30]
+MODEL_TYPES   = ['a', 'b', 'c']
 TARGET_COLUMN = 'sales_volume'
 GROUP_COLUMN  = 'category_num'
-TIME_STEPS    = 60                   # look-back window (reduced from 90 to 60
-                                     # so that val set — 89 rows/category —
-                                     # can produce sequences for all horizons)
+TIME_STEPS    = 60
 
 DATA_PATH     = r"C:\Users\ilsem\Documents\Thesis - memoire\dataset"
-OUTPUT_FOLDER = r"C:\Users\ilsem\Documents\Thesis - memoire\forecast_outputs2"
+OUTPUT_FOLDER = r"C:\Users\ilsem\Documents\Thesis - memoire\forecast_outputs3"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -121,7 +129,6 @@ def create_sequences_by_category(df_scaled, y_scaled, steps, horizon,
 
         for i in range(limit):
             X_list.append(X_cat[i: i + steps])
-            # Target is the value 'horizon' steps after the window ends
             y_list.append(y_cat[i + steps + horizon - 1])
 
     if not X_list:
@@ -176,26 +183,36 @@ def create_sequences_by_category_with_meta(df_scaled, y_scaled, steps,
 
 def build_att_bilstm_model(steps, n_features):
     """
-    2-layer Bidirectional LSTM with self-attention mechanism.
+    2-layer Bidirectional LSTM with self-attention and L2 regularization.
 
     Architecture
     ------------
     Input  (steps, n_features)
-      -> BiLSTM(64 units per direction) + Dropout(0.2)
-      -> BiLSTM(64 units per direction) + Dropout(0.2)
+      -> BiLSTM(64, L2=1e-4) + Dropout(0.2)
+      -> BiLSTM(64, L2=1e-4) + Dropout(0.2)
       -> Self-Attention  [query = value = output of 2nd BiLSTM]
       -> Last time step of attended sequence  -> Dense(1, linear)
 
+    L2 regularization is applied to both kernel and recurrent weights
+    to reduce overfitting, especially visible in Model A (more features).
+
     Two outputs are returned: [prediction, attention_scores]
     so attention weights can be inspected after training.
-    The model is compiled with loss only on the prediction head.
     """
     inp = Input(shape=(steps, n_features))
 
-    x = Bidirectional(LSTM(64, return_sequences=True))(inp)
+    # First BiLSTM layer with L2 regularization
+    x = Bidirectional(LSTM(64,
+                           return_sequences=True,
+                           kernel_regularizer=l2(1e-4),
+                           recurrent_regularizer=l2(1e-4)))(inp)
     x = Dropout(0.2)(x)
 
-    x = Bidirectional(LSTM(64, return_sequences=True))(x)
+    # Second BiLSTM layer with L2 regularization
+    x = Bidirectional(LSTM(64,
+                           return_sequences=True,
+                           kernel_regularizer=l2(1e-4),
+                           recurrent_regularizer=l2(1e-4)))(x)
     x = Dropout(0.2)(x)
 
     # Self-attention: the sequence attends to itself
@@ -265,19 +282,16 @@ for m in MODEL_TYPES:
     all_feature_cols = [c for c in train_raw.columns if c != GROUP_COLUMN]
 
     # Subset of features that actually need scaling
-    # (intersect with what's present in the file to be safe)
     cols_to_scale = [c for c in FEATURES_TO_SCALE if c in train_raw.columns]
 
     # ----------------------------------------------------------
     # 7b. Fit scalers ONCE per model — always on training data only
     # ----------------------------------------------------------
 
-    # x_scaler: scales numeric feature columns (NOT the target)
     x_scaler = MinMaxScaler()
     x_scaler.fit(train_raw[cols_to_scale])
 
-    # y_scaler: dedicated scaler for sales_volume only
-    # Kept separate so inverse_transform is clean and leak-free
+    # Dedicated scaler for target — avoids leakage
     y_scaler = MinMaxScaler()
     y_scaler.fit(train_raw[[TARGET_COLUMN]])
 
@@ -309,7 +323,7 @@ for m in MODEL_TYPES:
     val_cats   = val_raw[GROUP_COLUMN].values
     test_cats  = test_raw[GROUP_COLUMN].values
 
-    # Reconstruct proper dates for the test set (used in output CSV + plots)
+    # Reconstruct proper dates for the test set
     test_dates = pd.to_datetime(
         test_raw[['year', 'month', 'day']].rename(
             columns={'year': 'year', 'month': 'month', 'day': 'day'}
@@ -333,7 +347,6 @@ for m in MODEL_TYPES:
         X_va, y_va = create_sequences_by_category(
             val_scaled, y_val_sc, TIME_STEPS, h, val_cats, all_feature_cols)
 
-        # Test sequences also carry date + category metadata
         X_te, y_te, te_dates, te_cats = create_sequences_by_category_with_meta(
             test_scaled, y_test_sc, TIME_STEPS, h,
             test_cats, all_feature_cols, test_dates)
@@ -349,10 +362,8 @@ for m in MODEL_TYPES:
               f"X_va:{X_va.shape if has_val else 'empty'}  "
               f"X_te:{X_te.shape}")
 
-        # ---- Build dummy attention targets for the second model output ----
-        # Keras requires targets for every compiled output.
-        # Since the attention output has loss=None, we pass zero arrays —
-        # they are never used in the gradient computation.
+        # Dummy attention targets (required by Keras for the second output head,
+        # but never used in gradient computation since loss=None for that head)
         att_shape_tr = (len(X_tr), TIME_STEPS, TIME_STEPS)
         att_shape_va = (len(X_va), TIME_STEPS, TIME_STEPS) if has_val else None
 
@@ -365,7 +376,7 @@ for m in MODEL_TYPES:
         early_stop = EarlyStopping(
             monitor=monitor, patience=20, restore_best_weights=True)
 
-        nn_model.fit(
+        history = nn_model.fit(
             X_tr,
             y_tr_targets,
             validation_data=(X_va, y_va_targets) if has_val else None,
@@ -375,12 +386,38 @@ for m in MODEL_TYPES:
             verbose=1
         )
 
+        # ---- Save training history as CSV ----
+        history_df = pd.DataFrame(history.history)
+        history_df.to_csv(
+            os.path.join(OUTPUT_FOLDER, f"history_{exp_id}.csv"), index=False)
+
+        # ---- Save training history plot ----
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.plot(history_df['loss'], label='Train loss', linewidth=1.5)
+        if 'val_loss' in history_df.columns:
+            ax.plot(history_df['val_loss'], label='Val loss',
+                    linewidth=1.5, linestyle='--')
+        ax.set_title(f'Training history — {exp_id}', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss (MSE)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        # Mark the epoch where early stopping restored weights
+        best_epoch = np.argmin(history_df.get('val_loss',
+                                               history_df['loss']))
+        ax.axvline(x=best_epoch, color='red', linestyle=':', alpha=0.7,
+                   label=f'Best epoch ({best_epoch+1})')
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_FOLDER, f"history_{exp_id}.png"),
+                    dpi=100, bbox_inches='tight')
+        plt.close()
+
         # ---- Train XGBoost to correct residual errors ----
         # XGBoost input: only the BiLSTM scalar prediction per sample.
-        # This avoids the high-dimensional overfitting of 60*n_features columns.
         nn_pred_tr, _ = nn_model.predict(X_tr, verbose=0)
         nn_pred_tr    = nn_pred_tr.flatten()
-        residuals_tr  = y_tr - nn_pred_tr   # residuals in scaled space
+        residuals_tr  = y_tr - nn_pred_tr
 
         xgb_model = xgb.XGBRegressor(
             n_estimators=100,
@@ -395,7 +432,6 @@ for m in MODEL_TYPES:
         nn_pred_te   = nn_pred_te.flatten()
         xgb_residual = xgb_model.predict(nn_pred_te.reshape(-1, 1))
 
-        # Final prediction = BiLSTM + XGBoost residual correction (still scaled)
         final_scaled = nn_pred_te + xgb_residual
 
         # Inverse transform to original sales_volume scale
@@ -403,13 +439,10 @@ for m in MODEL_TYPES:
         pred   = y_scaler.inverse_transform(final_scaled.reshape(-1, 1)).flatten()
 
         # ---- Extract attention weights ----
-        # att_matrix shape from Keras Attention layer: (batch, seq_q, seq_k)
-        # Average over batch and query dims -> (seq_k,) = (TIME_STEPS,)
-        # Gives one importance score per lag day in the look-back window.
         if att_matrix.ndim == 3:
-            mean_att = att_matrix.mean(axis=(0, 1))     # -> (60,)
+            mean_att = att_matrix.mean(axis=(0, 1))
         elif att_matrix.ndim == 4:
-            mean_att = att_matrix.mean(axis=(0, 1, 2))  # -> (60,)
+            mean_att = att_matrix.mean(axis=(0, 1, 2))
         else:
             mean_att = att_matrix.mean(axis=0).flatten()
 
@@ -485,7 +518,7 @@ print("Saving metrics report ...")
 metrics_df = pd.DataFrame(results_log)
 metrics_df.to_csv(os.path.join(OUTPUT_FOLDER, "metrics_report.csv"), index=False)
 
-# ---- Styled table image (similar to Image 2 in the thesis) ----
+# ---- Styled table image ----
 fig, ax = plt.subplots(figsize=(14, 8))
 ax.axis('off')
 
@@ -511,11 +544,11 @@ for i in range(1, len(cell_data) + 1):
     for j in range(len(col_labels)):
         tbl[i, j].set_facecolor(bg)
 
-# Highlight the best MAE row per horizon in green (like Image 2)
+# Highlight the best MAE row per horizon in green
 for horizon_label in metrics_df['Horizon'].unique():
     sub      = metrics_df[metrics_df['Horizon'] == horizon_label]
     best_pos = sub['MAE'].idxmin()
-    row_pos  = metrics_df.index.get_loc(best_pos) + 1  # +1 because row 0 = header
+    row_pos  = metrics_df.index.get_loc(best_pos) + 1
     for j in range(len(col_labels)):
         tbl[row_pos, j].set_facecolor('#92D050')
 
@@ -529,10 +562,15 @@ print("  -> metrics_report.png saved.")
 
 
 # ============================================================
-# 10. LINE TREND PLOTS — one per horizon, 3 models overlaid
+# 10. ABSOLUTE ERROR TREND PLOTS — one per horizon, 3 models
+#
+# Each plot shows the daily absolute error (|actual - predicted|)
+# aggregated across all categories, for each of the 3 models.
+# This makes it easy to compare which model is closer to reality
+# on each date, without cluttering the chart with the actual line.
 # ============================================================
 
-print("Generating line trend plots ...")
+print("Generating absolute error trend plots ...")
 
 MODEL_COLORS = {'A': '#1f77b4', 'B': '#ff7f0e', 'C': '#2ca02c'}
 MODEL_LABELS = {
@@ -552,27 +590,19 @@ for h in HORIZONS:
         continue
 
     fig, ax = plt.subplots(figsize=(14, 5))
-    actual_plotted = False
 
     for model_label in ['A', 'B', 'C']:
         sub = h_data[h_data['model'] == model_label]
         if sub.empty:
             continue
 
-        # Aggregate by date: sum sales volume across all categories
-        daily = (sub.groupby('date')[['actual', 'predicted']]
+        # Aggregate absolute error by date: sum across all categories
+        daily = (sub.groupby('date')['absolute_error']
                     .sum()
                     .reset_index()
                     .sort_values('date'))
 
-        # Plot the actual line only once — it is the same real data for all models
-        if not actual_plotted:
-            ax.plot(daily['date'], daily['actual'],
-                    color='black', linewidth=1.8, linestyle='--',
-                    label='Actual', zorder=5)
-            actual_plotted = True
-
-        ax.plot(daily['date'], daily['predicted'],
+        ax.plot(daily['date'], daily['absolute_error'],
                 color=MODEL_COLORS[model_label], linewidth=1.3,
                 label=MODEL_LABELS[model_label])
 
@@ -581,10 +611,10 @@ for h in HORIZONS:
     ax.xaxis.set_major_locator(mdates.MonthLocator())
     plt.xticks(rotation=45, ha='right')
 
-    ax.set_title(f'Predicted vs Actual Total Sales — Horizon H{h} days',
+    ax.set_title(f'Absolute Error by Model — Horizon H{h} days',
                  fontsize=13, fontweight='bold')
     ax.set_xlabel('Date')
-    ax.set_ylabel('Total Sales Volume (all categories)')
+    ax.set_ylabel('Total Absolute Error (all categories)')
     ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
 
@@ -601,10 +631,9 @@ for h in HORIZONS:
 
 print("Generating attention heatmap ...")
 
-# Build DataFrame: rows = experiment IDs, columns = lag indices 0..59
 att_df = pd.DataFrame(attention_global).T   # shape (12, 60)
 att_df.columns = np.arange(TIME_STEPS)
-att_df = att_df.sort_index()               # sort rows alphabetically by exp_id
+att_df = att_df.sort_index()
 
 fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -615,7 +644,6 @@ sns.heatmap(
     cbar_kws={'label': 'Importance Score'}
 )
 
-# Show every other lag on the x-axis to avoid clutter
 tick_pos = np.arange(0, TIME_STEPS, 2)
 ax.set_xticks(tick_pos + 0.5)
 ax.set_xticklabels(tick_pos, fontsize=7, rotation=0)
@@ -633,7 +661,7 @@ print("  -> attention_heatmap.png saved.")
 
 
 # ============================================================
-# 12. print summary of all generated files
+# 12.  print summary of all generated files
 # ============================================================
 
 print("\n" + "=" * 60)
