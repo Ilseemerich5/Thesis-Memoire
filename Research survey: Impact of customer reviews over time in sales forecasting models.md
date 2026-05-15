@@ -1,4 +1,5 @@
-https://docs.google.com/forms/d/1ie03xjSx8R4kwS7rtNRu0dWeTiLTH4pisA2IBrRMmHc/edit
+Google forms survey: https://docs.google.com/forms/d/1ie03xjSx8R4kwS7rtNRu0dWeTiLTH4pisA2IBrRMmHc/edit
+Google sheets responses: https://docs.google.com/spreadsheets/d/1InyQoHkx3mAtlwZENVGFQEWszzrmvyM6-2Dr2gJeMfo/edit?gid=395093977#gid=395093977
 
 Research survey: Impact of customer reviews over time on consumer purchase decision on E-commerce platforms.
 
